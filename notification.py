@@ -1,3 +1,4 @@
+import datetime
 import requests
 import re
 
@@ -138,13 +139,45 @@ class Notification:
         target_type = target.get("type")
 
         if target_type == "telegram":
-            self._send_telegram_message(target["bot_token"], target["chat_id"], message)
+            formatted_message = self._format_telegram_message(
+                message,
+                target.get("sender_server", "GitHub Actions lottery-bot"),
+            )
+            self._send_telegram_message(target["bot_token"], target["chat_id"], formatted_message)
         elif target_type == "slack":
             self._send_slack_webhook(target.get("webhook_url"), message)
         elif target_type == "discord":
             self._send_discord_webhook(target.get("webhook_url"), message)
         else:
             print(f"[Info] Notification target not found. Message: {message}")
+
+    def _format_telegram_message(self, message: str, sender_server: str) -> str:
+        received_at = self._current_kst().strftime("%Y.%m.%d %H:%M:%S")
+        content = self._clean_telegram_content(message)
+        return (
+            f"[수신날짜] {received_at}\n"
+            f"[발신서버] {sender_server}\n"
+            f"[수신내용]\n"
+            f"{content}"
+        )
+
+    def _current_kst(self) -> datetime.datetime:
+        kst = datetime.timezone(datetime.timedelta(hours=9))
+        return datetime.datetime.now(kst)
+
+    def _clean_telegram_content(self, message: str) -> str:
+        content = message.replace("```ini\n", "")
+        content = content.replace("```\n", "\n")
+        content = content.replace("```", "")
+        content = content.replace(":moneybag:", "")
+        content = content.replace("*", "")
+        content = content.replace("`", "")
+        content = content.replace("🎉", "")
+        content = content.replace("🫠", "")
+        content = re.sub(r"[ \t]{2,}", " ", content)
+
+        lines = [line.rstrip() for line in content.splitlines()]
+        return "\n".join(lines).strip()
 
     def _send_telegram_message(self, bot_token: str, chat_id: str, message: str) -> None:
         if not bot_token or not chat_id:
