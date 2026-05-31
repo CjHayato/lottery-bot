@@ -53,6 +53,7 @@ def _notification_target() -> dict:
             "type": "telegram",
             "bot_token": telegram_bot_token,
             "chat_id": telegram_chat_id,
+            "sender_server": _clean_env_value("TELEGRAM_SENDER_SERVER") or "GitHub Actions lottery-bot",
         }
 
     slack_webhook_url = _clean_env_value("SLACK_WEBHOOK_URL")
