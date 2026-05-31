@@ -20,6 +20,7 @@
 - `COUNT`: 로또 구매 수량. 예: `5`
 - `TELEGRAM_BOT_TOKEN`: 텔레그램 BotFather에서 받은 봇 토큰
 - `TELEGRAM_CHAT_ID`: 알림을 받을 텔레그램 채팅 ID
+- `TELEGRAM_SENDER_SERVER`: 텔레그램 메시지의 `[발신서버]`에 표시할 이름. 선택값이며 기본값은 `GitHub Actions lottery-bot`
 
 텔레그램 값이 둘 다 있으면 텔레그램으로 알림을 보냅니다. 텔레그램을 쓰지 않는 경우 `SLACK_WEBHOOK_URL` 또는 `DISCORD_WEBHOOK_URL`을 사용할 수 있습니다.
 
