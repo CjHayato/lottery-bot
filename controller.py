@@ -1,5 +1,6 @@
 import os
 import sys
+import datetime
 from dotenv import load_dotenv
 
 import auth
@@ -7,6 +8,33 @@ import lotto645
 import win720
 import notification
 import time
+
+
+def _current_kst() -> datetime.datetime:
+    kst = datetime.timezone(datetime.timedelta(hours=9))
+    return datetime.datetime.now(kst)
+
+
+def _is_kst_monday(now: datetime.datetime = None) -> bool:
+    now = now or _current_kst()
+    return now.weekday() == 0
+
+
+def _should_skip_purchase() -> bool:
+    now = _current_kst()
+    if _is_kst_monday(now):
+        return False
+
+    print(
+        "[Info] 구매는 한국시간 월요일에만 실행합니다. "
+        f"현재: {now.strftime('%Y.%m.%d %H:%M:%S')} KST. 구매를 건너뜁니다."
+    )
+    return True
+
+
+def _is_purchase_success(response: dict) -> bool:
+    result = response.get("result", {})
+    return result.get("resultMsg", "FAILURE").upper() == "SUCCESS"
 
 
 def _clean_env_value(name: str):
@@ -130,6 +158,9 @@ def check():
 
 def buy(): 
     load_dotenv(override=True) 
+    if _should_skip_purchase():
+        return
+
     count = _purchase_count()
     mode = "AUTO"
 
@@ -137,6 +168,9 @@ def buy():
 
     response = buy_lotto645(auth_ctrl, count, mode) 
     send_message(1, 0, response=response, notify_target=notify_target)
+    if not _is_purchase_success(response):
+        print("[Info] 로또 구매가 실패하여 연금복권 구매를 건너뜁니다.")
+        return
 
     time.sleep(10)
 
@@ -148,6 +182,9 @@ def buy():
 
 def lotto_buy():
     load_dotenv(override=True)
+    if _should_skip_purchase():
+        return
+
     count = _purchase_count()
     auth_ctrl, _, notify_target = _setup_and_login()
     mode = "AUTO"
@@ -156,6 +193,9 @@ def lotto_buy():
     send_message(1, 0, response=response, notify_target=notify_target)
 
 def win720_buy():
+    if _should_skip_purchase():
+        return
+
     auth_ctrl, username, notify_target = _setup_and_login()
 
     response = buy_win720(auth_ctrl, username)
