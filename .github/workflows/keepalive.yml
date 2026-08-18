@@ -1,0 +1,23 @@
+name: Keep scheduled workflows active
+on:
+  schedule:
+    - cron: 37 0 1 * * # every month on 09:37 AM (KST)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: [ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Update keepalive marker
+        run: |
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .github/keepalive.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/keepalive.txt
+          git diff --cached --quiet || git commit -m "Keep scheduled workflows active"
+          git push
