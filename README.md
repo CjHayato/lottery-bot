@@ -24,5 +24,17 @@
 
 텔레그램 값이 둘 다 있으면 텔레그램으로 알림을 보냅니다. 텔레그램을 쓰지 않는 경우 `SLACK_WEBHOOK_URL` 또는 `DISCORD_WEBHOOK_URL`을 사용할 수 있습니다.
 
+## 로그인 오류 확인 및 검증
+
+RSA 키 조회가 JSON이 아닌 응답이나 잘못된 키를 반환하면 로그인 절차를 최대 5회 시도합니다. 재시도 간격은 2, 4, 8, 16초이며, 모두 실패하면 작업은 실패 상태로 종료됩니다.
+
+로그의 `stage=homepage`와 `ConnectTimeout`은 사이트 연결 단계의 시간 초과를 뜻합니다. `stage=rsa_key`와 `RSA key response`는 RSA 응답 오류를 뜻하며, HTTP 상태·응답 형식·최종 접속 경로·응답 크기로 진단할 수 있습니다. 응답 원문, 키 값, 쿠키와 URL 쿼리는 진단 정보에 포함하지 않습니다. 지속적인 사이트 연결 문제는 재시도만으로 해결되지 않을 수 있습니다.
+
+아래 테스트는 HTTP 요청을 모의 처리하므로 실제 로그인, 구매 또는 알림 전송을 수행하지 않습니다.
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
 # Reference 
 - https://github.com/roeniss/dhlottery-api

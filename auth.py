@@ -4,12 +4,19 @@ import requests
 import json
 import base64
 import binascii
+import re
 import time
+from urllib.parse import urlsplit
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 from HttpClient import HttpClientSingleton
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+class RSAKeyResponseError(RuntimeError):
+    """The RSA endpoint returned an unusable response before login."""
+
 
 class AuthController:
     _REQ_HEADERS = {
@@ -41,12 +48,15 @@ class AuthController:
 
         max_retries = 5
         for attempt in range(max_retries):
+            stage = "homepage"
             try:
                 # 1. Warm-up
                 self.http_client.get("https://www.dhlottery.co.kr/")
+                stage = "login_page"
                 self.http_client.get("https://www.dhlottery.co.kr/user.do?method=login", headers=self._REQ_HEADERS)
                 
                 # 2. RSA Key Fetch
+                stage = "rsa_key"
                 modulus, exponent = self._get_rsa_key()
 
                 # 3. Encrypt
@@ -68,15 +78,21 @@ class AuthController:
                 }
 
                 # 5. Execute Login
+                stage = "login_request"
                 self._try_login(headers, data)
                 return # Success
                 
-            except requests.RequestException as e:
-                time.sleep(2)
+            except (requests.RequestException, RSAKeyResponseError) as e:
+                # Transport exception messages can contain request URLs or credentials.
+                detail = str(e) if isinstance(e, RSAKeyResponseError) else type(e).__name__
                 if attempt == max_retries - 1:
-                     print(f"[Error] Login sequence failed after {max_retries} attempts: {e}")
+                     print(f"[Error] Login sequence failed after {max_retries} attempts "
+                           f"(stage={stage}): {detail}", flush=True)
                      raise
-                print(f"[Retry] Login failed ({attempt+1}/{max_retries}): {e}. Retrying...")
+                delay = 2 ** (attempt + 1)
+                print(f"[Retry] Login failed ({attempt+1}/{max_retries}, stage={stage}): "
+                      f"{detail}. Retrying in {delay}s...", flush=True)
+                time.sleep(delay)
         
     def add_auth_cred_to_headers(self, headers: dict) -> str:
         assert isinstance(headers, dict)
@@ -106,18 +122,57 @@ class AuthController:
         
         try:
             data = res.json()
-        except ValueError:
-             raise ValueError(f"Failed to parse JSON. St: {res.status_code}")
-        
-        if "data" in data and "rsaModulus" in data["data"]:
-            modulus = data["data"]["rsaModulus"]
-            exponent = data["data"]["publicExponent"]
-            return modulus, exponent
-        
-        if "rsaModulus" in data:
-            return data["rsaModulus"], data["publicExponent"]
-            
-        raise KeyError("rsaModulus not found")
+        except ValueError as e:
+            raise RSAKeyResponseError(
+                f"RSA key response is not valid JSON. {self._rsa_response_summary(res)}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise RSAKeyResponseError(
+                f"RSA key response must be a JSON object. {self._rsa_response_summary(res)}"
+            )
+
+        key_data = data.get("data")
+        if not isinstance(key_data, dict) or "rsaModulus" not in key_data:
+            key_data = data
+
+        modulus = key_data.get("rsaModulus")
+        exponent = key_data.get("publicExponent")
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]+", value)
+                   for value in (modulus, exponent)):
+            raise RSAKeyResponseError(
+                f"RSA key response has missing or invalid key fields. {self._rsa_response_summary(res)}"
+            )
+
+        try:
+            public_exponent = int(exponent, 16)
+            if public_exponent < 3 or public_exponent % 2 == 0:
+                raise ValueError("RSA public exponent must be odd and greater than one")
+            RSA.construct((int(modulus, 16), public_exponent))
+        except ValueError as e:
+            raise RSAKeyResponseError(
+                f"RSA key response has invalid public key parameters. {self._rsa_response_summary(res)}"
+            ) from e
+
+        return modulus, exponent
+
+    @staticmethod
+    def _rsa_response_summary(res: requests.Response) -> str:
+        # Never include the response body, key values, cookies, or URL query.
+        final_url = urlsplit(res.url or "")
+        content_type = res.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", content_type):
+            content_type = "unknown"
+        body = res.text.lstrip()
+        body_kind = "empty" if not body else "html" if body.startswith("<") else "other"
+        return json.dumps({
+            "status": res.status_code,
+            "content_type": content_type,
+            "final_host": final_url.hostname,
+            "final_path": final_url.path.split(";", 1)[0],
+            "response_bytes": len(res.content),
+            "body_kind": body_kind,
+        }, ensure_ascii=True)
 
     def _rsa_encrypt(self, text, modulus, exponent):
         key_spec = RSA.construct((int(modulus, 16), int(exponent, 16)))
