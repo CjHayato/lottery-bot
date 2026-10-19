@@ -25,6 +25,13 @@ class CheckIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.logged_in = True
         self.query_failure = False
+        self.pension_total = 5
+        self.pension_records = [{
+            "ltEpsdView": "333회", "ltEpsd": 333, "ltGdsCd": "LP72",
+            "gmInfo": f"{group}:012348", "ltWnResult": "낙첨", "ltWnAmt": 0,
+            "ntslOrdrNo": "offline-order", "eltOrdrDt": "20261012", "epsdRflDt": "20261015",
+        } for group in range(1, 6)]
+        self.pension_records[-1].update(ltWnResult="당첨", ltWnAmt=1000, wnRnk=7)
         self.client = MagicMock()
         self.client.session = requests.Session()
         self.addCleanup(self.client.session.close)
@@ -38,6 +45,7 @@ class CheckIntegrationTests(unittest.TestCase):
             patch("auth.time.sleep"),
             patch("common.time.sleep"),
             patch("controller.time.sleep"),
+            patch("requests.sessions.Session.request", side_effect=AssertionError("Network forbidden")),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -79,12 +87,13 @@ class CheckIntegrationTests(unittest.TestCase):
                 if is_lotto:
                     return self.response(body="<html>not account data</html>")
                 raise requests.ConnectTimeout("offline simulated timeout")
-            return self.response({"data": {"list": [{
-                "ltEpsdView": "1247회" if is_lotto else "333회",
-                "ltWnAmt": "0" if is_lotto else "1000",
-                "ltGdsCd": params["ltGdsCd"], "ltEpsd": "offline-round",
-                "gmInfo": "offline-barcode", "ntslOrdrNo": "offline-order",
-            }]}})
+            if is_lotto:
+                return self.response({"data": {"total": 1, "list": [{
+                    "ltEpsdView": "1247회", "ltWnAmt": "0",
+                    "ltGdsCd": "LO40", "ltEpsd": "1247",
+                    "gmInfo": "offline-barcode", "ntslOrdrNo": "offline-order",
+                }]}})
+            return self.response({"data": {"total": self.pension_total, "list": self.pension_records}})
         if url.endswith("/mypage/lotto645TicketDetail.do"):
             return self.response({"data": {"ticket": {
                 "game_dtl": [{"rank": "0", "num": ["1", "2", "3", "4", "5", "6"]}],
@@ -105,12 +114,53 @@ class CheckIntegrationTests(unittest.TestCase):
         self.assertIn("다음 기회", messages[0])
         self.assertIn("333회", messages[1])
         self.assertIn("당첨 되었습니다", messages[1])
+        self.assertIn("1,000 원", messages[1])
+        self.assertNotIn("다음 기회", messages[1])
+        self.assertTrue(all("lottery720select.do" not in call.args[0]
+                            for call in self.client.get.call_args_list))
         for message in messages:
             self.assertIn("7,000원", message)
             self.assertNotIn("조회 실패", message)
         self.assertFalse(any(cookie.domain == ".dhlottery.co.kr"
                              for cookie in self.client.session.cookies))
         self.client.post.assert_called_once()
+
+    def test_complete_losing_pension_ledger_shows_all_five_tickets(self):
+        self.pension_records[-1].update(ltWnResult="낙첨", ltWnAmt=0)
+        controller.check()
+
+        message = self.messages()[1]
+        self.assertIn("다음 기회", message)
+        self.assertNotIn("당첨 되었습니다", message)
+        self.assertNotIn("조회 실패", message)
+        for group in range(1, 6):
+            self.assertRegex(message, rf"{group}조 낙첨\s+0\s+1\s+2\s+3\s+4\s+8")
+        self.assertTrue(all("lottery720select.do" not in call.args[0]
+                            for call in self.client.get.call_args_list))
+
+    def test_incomplete_pension_page_cannot_hide_later_winner_or_finish_green(self):
+        self.pension_total = 6
+        with self.assertRaisesRegex(RuntimeError, "win720:winning_incomplete_result"):
+            controller.check()
+
+        messages = self.messages()
+        self.assertEqual(len(messages), 2)
+        self.assertIn("당첨 여부 미확인", messages[1])
+        self.assertNotIn("다음 기회", messages[1])
+        self.assertNotIn("당첨 되었습니다", messages[1])
+        self.assertTrue(any("lottery720select.do" in call.args[0]
+                            for call in self.client.get.call_args_list))
+        self.client.post.assert_called_once()
+
+    def test_pending_later_pension_ticket_never_becomes_losing_message(self):
+        self.pension_records[-1].update(ltWnResult="미확인", ltWnAmt=None)
+        with self.assertRaises(RuntimeError):
+            controller.check()
+
+        message = self.messages()[1]
+        self.assertIn("당첨 여부 미확인", message)
+        self.assertNotIn("다음 기회", message)
+        self.assertNotIn("당첨 되었습니다", message)
 
     def test_purchase_login_keeps_game_cookie_setup_without_making_a_purchase(self):
         controller._setup_and_login(purchase=True)

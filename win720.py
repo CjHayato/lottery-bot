@@ -286,6 +286,11 @@ class Win720:
             if not isinstance(data, dict) or not isinstance(data.get("list"), list):
                 raise common.LotteryQueryError("invalid_response")
             if not data["list"]:
+                if "total" in data:
+                    total = data["total"]
+                    if (isinstance(total, bool) or not isinstance(total, (str, int))
+                            or not re.fullmatch(r"[0-9]+", str(total)) or int(total) != 0):
+                        raise common.LotteryQueryError("invalid_response")
                 return {"status": "no_data"}
 
             item = data["list"][0]
@@ -297,6 +302,8 @@ class Win720:
             round_no = str(round_no).replace("회", "").strip()
             if not round_no.isdigit():
                 raise common.LotteryQueryError("invalid_response")
+            if item.get("ltWnResult") in ("미확인", "미추첨", "추첨중"):
+                raise common.LotteryQueryError("result_pending")
             amount = common.parse_amount(item.get("ltWnAmt"))
             result_data = {
                 "status": "success",
@@ -306,37 +313,69 @@ class Win720:
                 "winning_date": item.get("epsdRflDt", "-"),
                 "win720_details": [],
             }
+            ledger_result = self._complete_ledger_details(data, round_no)
+            if ledger_result is not None:
+                details, total_amount = ledger_result
+                result_data.update({
+                    "money": f"{total_amount:,} 원",
+                    "win720_details": details,
+                    "detail_source": "ledger",
+                })
+                return result_data
         except common.LotteryQueryError as error:
             logger.error("[Error] Win720 check failed (code=%s)", error.code)
             return {"status": "error", "error_code": error.code}
 
+        # The first ticket's amount cannot establish the entire round's result.
+        # Keep legacy detail diagnostics, but leave the summary unconfirmed.
+        result_data.update({"status": "error", "error_code": "incomplete_result"})
+        detail_failure_stage = "request"
+        detail_failure_reason = "request_failed"
+        detail_schema = {"type": "unavailable"}
+        record_schema = {"type": "unavailable"}
         try:
             detail_data = common.get_json_response(
                 self.http_client,
                 "https://www.dhlottery.co.kr/mypage/lottery720select.do",
                 params={"ntslOrdrNo": item.get("ntslOrdrNo")}, headers=headers,
             )
+            detail_schema = self._detail_response_schema(detail_data)
             detail_data = detail_data.get("data", detail_data)
-            if not isinstance(detail_data, dict) or not isinstance(detail_data.get("list"), list):
+            detail_failure_stage = "response_schema"
+            detail_failure_reason = "invalid_data"
+            if not isinstance(detail_data, dict):
                 raise common.LotteryQueryError("detail_error")
+            detail_failure_reason = "invalid_list"
+            if not isinstance(detail_data.get("list"), list):
+                raise common.LotteryQueryError("detail_error")
+            detail_failure_reason = "empty_list"
             if not detail_data["list"]:
                 raise common.LotteryQueryError("detail_error")
 
             win720_details = []
             for i, detail in enumerate(detail_data["list"]):
+                detail_failure_stage = "record_schema"
+                detail_failure_reason = "invalid_record"
+                record_schema = self._detail_response_schema(detail)
                 if not isinstance(detail, dict):
                     raise common.LotteryQueryError("detail_error")
                 info_cn = detail.get("ltGmInfoCn")
                 rank_raw = detail.get("wnRnk")
-                if (not isinstance(info_cn, str) or not info_cn
-                        or isinstance(rank_raw, bool)
-                        or not isinstance(rank_raw, (str, int))
-                        or not str(rank_raw).isdigit()):
+                detail_failure_reason = "invalid_number_info"
+                if not isinstance(info_cn, str) or not info_cn:
+                    raise common.LotteryQueryError("detail_error")
+                detail_failure_reason = "invalid_rank_type"
+                if isinstance(rank_raw, bool) or not isinstance(rank_raw, (str, int)):
+                    raise common.LotteryQueryError("detail_error")
+                detail_failure_reason = "invalid_rank_format"
+                if not str(rank_raw).isdigit():
                     raise common.LotteryQueryError("detail_error")
                 rank = int(rank_raw)
                 status = "0등" if rank == 0 else f"{rank}등"
                 if ":" in info_cn:
                     group, number_str = info_cn.split(":", 1)
+                    detail_failure_stage = "number_format"
+                    detail_failure_reason = "invalid_group_or_number"
                     if not group.isdigit() or not number_str.isdigit():
                         raise common.LotteryQueryError("detail_error")
                     hl_count = {1: 6, 2: 6, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1}.get(rank, 0)
@@ -350,11 +389,118 @@ class Win720:
                     result = info_cn
                 win720_details.append({"label": label, "result": result, "status": status})
             result_data["win720_details"] = win720_details
-        except common.LotteryQueryError:
-            logger.error("[Error] Win720 detail failed (code=detail_error)")
-            result_data.update({"detail_error": True, "error_code": "detail_error"})
+        except common.LotteryQueryError as error:
+            logger.error(
+                "[Error] Win720 detail failed (code=%s, stage=%s, reason=%s, schema=%s, record_schema=%s)",
+                error.code, detail_failure_stage, detail_failure_reason,
+                json.dumps(detail_schema, sort_keys=True), json.dumps(record_schema, sort_keys=True),
+            )
+            result_data.update({
+                "detail_error": True,
+                "error_code": "detail_error",
+                "detail_error_code": error.code,
+                "detail_failure_stage": detail_failure_stage,
+                "detail_failure_reason": detail_failure_reason,
+            })
 
         return result_data
+
+    @staticmethod
+    def _complete_ledger_details(data: dict, round_no: str):
+        """Use the same ticket fields rendered by the official purchase ledger.
+
+        Only a complete page can supply all tickets for the selected round.
+        Legacy or incomplete responses continue through the detail API path.
+        """
+        records = data["list"]
+        total = data.get("total")
+        if (isinstance(total, bool) or not isinstance(total, (str, int))
+                or not re.fullmatch(r"[0-9]+", str(total)) or int(total) != len(records)):
+            return None
+
+        details = []
+        total_amount = 0
+        for record in records:
+            if not isinstance(record, dict):
+                return None
+            record_round = record.get("ltEpsdView")
+            if isinstance(record_round, bool) or not isinstance(record_round, (str, int)):
+                return None
+            record_round = str(record_round).replace("회", "").strip()
+            if not re.fullmatch(r"[0-9]+", record_round):
+                return None
+            if record_round != round_no:
+                continue
+            if record.get("ltGdsCd") != "LP72":
+                return None
+            info = record.get("gmInfo")
+            match = re.fullmatch(r"([1-5]):([0-9]{6})", info.strip()) if isinstance(info, str) else None
+            if match is None:
+                return None
+            site_status = record.get("ltWnResult")
+            if site_status in ("미확인", "미추첨", "추첨중"):
+                raise common.LotteryQueryError("result_pending")
+            try:
+                amount = common.parse_amount(record.get("ltWnAmt"))
+            except common.LotteryQueryError:
+                return None
+
+            rank = 0
+            if site_status == "낙첨" and amount == 0:
+                # A missing rank is not inferred as zero: the site says "낙첨".
+                status = "낙첨"
+            elif site_status == "당첨" and amount > 0:
+                status = "당첨"
+                raw_rank = record.get("wnRnk")
+                if raw_rank not in (None, ""):
+                    if (isinstance(raw_rank, bool) or not isinstance(raw_rank, (str, int))
+                            or not re.fullmatch(r"[0-9]+", str(raw_rank))):
+                        return None
+                    rank = int(raw_rank)
+                    if 1 <= rank <= 7:
+                        status = f"{rank}등"
+            else:
+                return None
+
+            group, number = match.groups()
+            highlight_count = {1: 6, 2: 6, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1}.get(rank, 0)
+            formatted = " ".join(
+                f"[{digit}]" if index >= len(number) - highlight_count else f" {digit} "
+                for index, digit in enumerate(number)
+            )
+            details.append({"label": f"{group}조", "status": status, "result": formatted})
+            total_amount += amount
+        return (details, total_amount) if details else None
+
+    @staticmethod
+    def _detail_response_schema(payload) -> dict:
+        """Describe only known field names and types, never account/ticket values."""
+        allowed_fields = ("data", "list", "ltGmInfoCn", "wnRnk")
+
+        def describe(value, depth=0):
+            if value is None:
+                return {"type": "null"}
+            if isinstance(value, bool):
+                return {"type": "boolean"}
+            if isinstance(value, str):
+                return {"type": "string"}
+            if isinstance(value, (int, float)):
+                return {"type": "number"}
+            if isinstance(value, list):
+                summary = {"type": "array", "length": len(value)}
+                if value and depth < 4:
+                    summary["first_item"] = describe(value[0], depth + 1)
+                return summary
+            if isinstance(value, dict):
+                summary = {"type": "object"}
+                if depth < 4:
+                    fields = {name: describe(value[name], depth + 1) for name in allowed_fields if name in value}
+                    if fields:
+                        summary["fields"] = fields
+                return summary
+            return {"type": "other"}
+
+        return describe(payload)
 
     def _show_result(self, body: dict) -> None:
         assert isinstance(body, dict)

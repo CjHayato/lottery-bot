@@ -179,14 +179,17 @@ class WinningQueryTests(unittest.TestCase):
                     json_response(self.detail_for(field)),
                 ]
                 result = game.check_winning(self.auth_ctrl)
-                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["status"], "success" if product == "LO40" else "error")
                 self.assertEqual(result["round"], "1200")
                 self.assertEqual(result["money"], "5,000 원")
                 self.assertEqual(result["purchased_date"], "20261012")
                 self.assertEqual(result["winning_date"], "20261017")
                 self.assertEqual(len(result[field]), 1)
                 self.assertNotIn("detail_error", result)
-                self.assertNotIn("error_code", result)
+                if product == "LO40":
+                    self.assertNotIn("error_code", result)
+                else:
+                    self.assertEqual(result["error_code"], "incomplete_result")
                 self.assertEqual(self.client.get.call_count, 2)
                 request = self.client.get.call_args_list[0]
                 self.assertEqual(request.kwargs["params"]["ltGdsCd"], product)
@@ -237,8 +240,13 @@ class WinningQueryTests(unittest.TestCase):
         for game, field, product in self.games:
             with self.subTest(product=product):
                 self.reset()
+                item = {**self.item, "ltWnAmt": 0}
+                data = {"list": [item]}
+                if product == "LP72":
+                    item.update(ltGdsCd="LP72", gmInfo="1:123456", ltWnResult="낙첨")
+                    data["total"] = 1
                 self.client.get.side_effect = [
-                    json_response({"data": {"list": [{**self.item, "ltWnAmt": 0}]}}),
+                    json_response({"data": data}),
                     json_response(self.detail_for(field)),
                 ]
                 result = game.check_winning(self.auth_ctrl)
@@ -280,7 +288,7 @@ class WinningQueryTests(unittest.TestCase):
                 ] * 3
                 with self.assertLogs(level="ERROR") as logs:
                     result = game.check_winning(self.auth_ctrl)
-                self.assertEqual(result["status"], "success")
+                self.assertEqual(result["status"], "success" if product == "LO40" else "error")
                 self.assertEqual(result["round"], "1200")
                 self.assertEqual(result["money"], "5,000 원")
                 self.assertEqual(result[field], [])

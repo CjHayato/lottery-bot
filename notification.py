@@ -17,6 +17,8 @@ class Notification:
         "not_authenticated": "로그인 상태 확인 실패",
         "login_unverified": "로그인 성공 여부 확인 실패",
         "api_error": "사이트 처리 오류",
+        "result_pending": "추첨 결과 미확인",
+        "incomplete_result": "구매 내역 전체 결과 미확인",
         "check_error": "조회 처리 오류",
         "notification_error": "알림 전송 실패",
     }

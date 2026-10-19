@@ -15,7 +15,8 @@ class LotteryQueryError(RuntimeError):
 
     _CODES = {
         "timeout", "unauthorized", "forbidden", "connection_error", "http_error",
-        "invalid_json", "invalid_response", "invalid_amount", "detail_error", "api_error",
+        "invalid_json", "invalid_response", "invalid_amount", "detail_error", "api_error", "result_pending",
+        "incomplete_result",
     }
 
     def __init__(self, code: str):
