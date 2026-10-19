@@ -3,6 +3,76 @@ import requests
 import re
 
 class Notification:
+    _ERROR_REASONS = {
+        "timeout": "응답 시간 초과",
+        "unauthorized": "로그인 확인 필요",
+        "forbidden": "접근 거부",
+        "connection_error": "사이트 연결 실패",
+        "http_error": "사이트 응답 오류",
+        "invalid_json": "응답 형식 오류",
+        "invalid_response": "응답 정보 누락 또는 형식 오류",
+        "invalid_amount": "금액 정보 오류",
+        "detail_error": "상세 정보 조회 실패",
+        "authentication_error": "로그인 확인 실패",
+        "not_authenticated": "로그인 상태 확인 실패",
+        "login_unverified": "로그인 성공 여부 확인 실패",
+        "api_error": "사이트 처리 오류",
+        "result_pending": "추첨 결과 미확인",
+        "incomplete_result": "구매 내역 전체 결과 미확인",
+        "check_error": "조회 처리 오류",
+        "notification_error": "알림 전송 실패",
+    }
+
+    @classmethod
+    def safe_error_code(cls, code) -> str:
+        return code if isinstance(code, str) and code in cls._ERROR_REASONS else "invalid_response"
+
+    @classmethod
+    def error_reason(cls, code) -> str:
+        return cls._ERROR_REASONS[cls.safe_error_code(code)]
+
+    @staticmethod
+    def winning_status(winning: dict) -> str:
+        status = winning.get("status")
+        if status == "no_data":
+            return status
+        if status != "success":
+            return "error"
+        round_no = winning.get("round")
+        if (isinstance(round_no, bool) or not re.fullmatch(r"[0-9]+", str(round_no or "").strip())
+                or int(round_no) <= 0):
+            return "error"
+        money = winning.get("money")
+        if isinstance(money, bool) or not isinstance(money, (str, int)):
+            return "error"
+        if not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)\s*원?", str(money).strip()):
+            return "error"
+        return "success"
+
+    def send_login_failure_message(self, target: dict) -> None:
+        self._send_message(target, "로그인 확인 실패, 당첨 여부 미확인. 사이트 로그인 상태를 확인해 주세요.")
+
+    def _winning_summary(self, label: str, winning: dict) -> str:
+        balance = winning.get("balance", "확인불가")
+        status = self.winning_status(winning)
+        if status == "error":
+            reason = self.error_reason(winning.get("error_code"))
+            return f"{label} - 당첨 조회 실패 (당첨 여부 미확인) · {reason} (남은잔액 : {balance})"
+        if status == "no_data":
+            return f"{label} - 조회 기간 내 구매 내역 없음 (남은잔액 : {balance})"
+        amount = int(re.sub(r"[,\s원]", "", str(winning["money"])))
+        if amount:
+            return f"{label} *{winning['round']}회* - *{winning['money']}* 당첨 되었습니다 🎉 (남은잔액 : {balance})"
+        return f"{label} *{winning['round']}회* - 다음 기회에... 🫠 (남은잔액 : {balance})"
+
+    def _detail_warning(self, winning: dict) -> str:
+        if winning.get("detail_error"):
+            code = winning.get("detail_error_code", "detail_error")
+            if code == "detail_error":
+                return "상세 정보 조회 실패 (번호·등수 미확인)"
+            return f"상세 정보 조회 실패 ({self.error_reason(code)})"
+        return ""
+
     def send_lotto_buying_message(self, body: dict, target: dict) -> None:
 
         result = body.get("result", {})
@@ -60,79 +130,56 @@ class Notification:
 
     def send_lotto_winning_message(self, winning: dict, target: dict) -> None:
         assert type(winning) == dict
-
-        balance_str = winning.get('balance', '확인불가')
-        try: 
-            round = winning["round"]
-            money = winning["money"]
-
-            if winning["lotto_details"]:
-                max_label_status_length = max(len(f"{line['label']} {line['status']}") for line in winning["lotto_details"])
-
-                formatted_lines = []
-                for line in winning["lotto_details"]:
-                    line_label_status = f"{line['label']} {line['status']}".ljust(max_label_status_length)
-                    line_result = line["result"]
-    
-                    formatted_nums = []
-                    for num in line_result:
-                        raw_num = re.search(r'\d+', num).group()
-                        formatted_num = f"{int(raw_num):02d}"
-                        if '✨' in num:
-                            formatted_nums.append(f"[{formatted_num}]")
-                        else:
-                            formatted_nums.append(f" {formatted_num} ")
-    
-                    formatted_nums = [f"{num:>6}" for num in formatted_nums]
-    
-                    formatted_line = f"{line_label_status} " + " ".join(formatted_nums)
-                    formatted_lines.append(formatted_line)
-    
-                formatted_results = "\n".join(formatted_lines)
-            else:
-                formatted_results = "상세 정보를 불러오지 못했습니다."
-
-            is_winning = winning['money'] != "-" and winning['money'] != "0 원" and winning['money'] != "0"
-            
-            if is_winning:
-                winning_message = f"로또 *{winning['round']}회* - *{winning['money']}* 당첨 되었습니다 🎉 (남은잔액 : {balance_str})"
-            else:
-                winning_message = f"로또 *{winning['round']}회* - 다음 기회에... 🫠 (남은잔액 : {balance_str})"
-
-            self._send_message(target, f"```ini\n{formatted_results}```\n{winning_message}")
-        except KeyError:
-            message = f"로또 - 다음 기회에... 🫠 (남은잔액 : {balance_str})"
-            self._send_message(target, message)
+        summary = self._winning_summary("로또", winning)
+        if self.winning_status(winning) != "success":
+            self._send_message(target, summary)
             return
+
+        formatted_lines = []
+        details = winning.get("lotto_details") or []
+        try:
+            max_length = max((len(f"{line['label']} {line['status']}") for line in details), default=0)
+            for line in details:
+                label = f"{line['label']} {line['status']}".ljust(max_length)
+                numbers = []
+                for num in line["result"]:
+                    raw = re.search(r"\d+", str(num))
+                    if raw is None:
+                        raise ValueError("Invalid lottery number")
+                    number = f"{int(raw.group()):02d}"
+                    numbers.append(f"[{number}]" if "✨" in str(num) else f" {number} ")
+                formatted_lines.append(f"{label} " + " ".join(f"{number:>6}" for number in numbers))
+        except (KeyError, TypeError, ValueError):
+            formatted_lines = []
+            winning["detail_error"] = True
+        detail_warning = self._detail_warning(winning)
+        if detail_warning:
+            formatted_lines.append(detail_warning)
+        details_message = "```ini\n" + "\n".join(formatted_lines) + "```\n" if formatted_lines else ""
+        self._send_message(target, details_message + summary)
 
     def send_win720_winning_message(self, winning: dict, target: dict) -> None:
         assert type(winning) == dict
+        summary = self._winning_summary("연금복권", winning)
+        if self.winning_status(winning) != "success":
+            self._send_message(target, summary)
+            return
 
-        balance_str = winning.get('balance', '확인불가')
+        formatted_lines = []
+        details = winning.get("win720_details") or []
         try:
-            if "win720_details" in winning and winning["win720_details"]:
-                max_label_status_length = max(len(f"{line['label']} {line['status']}") for line in winning["win720_details"])
-                formatted_lines = []
-                for line in winning["win720_details"]:
-                    line_label_status = f"{line['label']} {line['status']}".ljust(max_label_status_length)
-                    formatted_lines.append(f"{line_label_status} {line['result']}")
-                
-                formatted_results = "\n".join(formatted_lines)
-                message_content = f"```ini\n{formatted_results}```\n"
-            else:
-                message_content = ""
-
-            is_winning = winning['money'] != "-" and winning['money'] != "0 원" and winning['money'] != "0"
-
-            if is_winning:
-                message = f"{message_content}연금복권 *{winning['round']}회* - *{winning['money']}* 당첨 되었습니다 🎉 (남은잔액 : {balance_str})"
-            else:
-                 message = f"{message_content}연금복권 *{winning['round']}회* - 다음 기회에... 🫠 (남은잔액 : {balance_str})"
-
-            self._send_message(target, message)
-        except KeyError:
-            message = f"연금복권 - 다음 기회에... 🫠 (남은잔액 : {balance_str})"
-            self._send_message(target, message)
+            max_length = max((len(f"{line['label']} {line['status']}") for line in details), default=0)
+            for line in details:
+                label = f"{line['label']} {line['status']}".ljust(max_length)
+                formatted_lines.append(f"{label} {line['result']}")
+        except (KeyError, TypeError):
+            formatted_lines = []
+            winning["detail_error"] = True
+        detail_warning = self._detail_warning(winning)
+        if detail_warning:
+            formatted_lines.append(detail_warning)
+        details_message = "```ini\n" + "\n".join(formatted_lines) + "```\n" if formatted_lines else ""
+        self._send_message(target, details_message + summary)
 
     def _send_message(self, target: dict, message: str) -> None:
         target = target or {"type": "none"}

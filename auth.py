@@ -4,12 +4,32 @@ import requests
 import json
 import base64
 import binascii
+import re
 import time
+from urllib.parse import urlsplit
 from Crypto.PublicKey import RSA
 from Crypto.Cipher import PKCS1_v1_5
 from HttpClient import HttpClientSingleton
+import common
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+
+class RSAKeyResponseError(RuntimeError):
+    """The RSA endpoint returned an unusable response before login."""
+
+
+class AuthenticationError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"Login verification failed: {code}")
+
+
+class AccountQueryError(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"Account query failed: {code}")
+
 
 class AuthController:
     _REQ_HEADERS = {
@@ -41,12 +61,15 @@ class AuthController:
 
         max_retries = 5
         for attempt in range(max_retries):
+            stage = "homepage"
             try:
                 # 1. Warm-up
                 self.http_client.get("https://www.dhlottery.co.kr/")
-                self.http_client.get("https://www.dhlottery.co.kr/user.do?method=login", headers=self._REQ_HEADERS)
+                stage = "login_page"
+                self.http_client.get("https://www.dhlottery.co.kr/login", headers=self._REQ_HEADERS)
                 
                 # 2. RSA Key Fetch
+                stage = "rsa_key"
                 modulus, exponent = self._get_rsa_key()
 
                 # 3. Encrypt
@@ -58,7 +81,7 @@ class AuthController:
                 headers.update({
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Origin": "https://www.dhlottery.co.kr",
-                    "Referer": "https://www.dhlottery.co.kr/user.do?method=login"
+                    "Referer": "https://www.dhlottery.co.kr/login"
                 })
                 
                 data = {
@@ -68,15 +91,21 @@ class AuthController:
                 }
 
                 # 5. Execute Login
+                stage = "login_request"
                 self._try_login(headers, data)
                 return # Success
                 
-            except requests.RequestException as e:
-                time.sleep(2)
+            except (requests.RequestException, RSAKeyResponseError) as e:
+                # Transport exception messages can contain request URLs or credentials.
+                detail = str(e) if isinstance(e, RSAKeyResponseError) else type(e).__name__
                 if attempt == max_retries - 1:
-                     print(f"[Error] Login sequence failed after {max_retries} attempts: {e}")
+                     print(f"[Error] Login sequence failed after {max_retries} attempts "
+                           f"(stage={stage}): {detail}", flush=True)
                      raise
-                print(f"[Retry] Login failed ({attempt+1}/{max_retries}): {e}. Retrying...")
+                delay = 2 ** (attempt + 1)
+                print(f"[Retry] Login failed ({attempt+1}/{max_retries}, stage={stage}): "
+                      f"{detail}. Retrying in {delay}s...", flush=True)
+                time.sleep(delay)
         
     def add_auth_cred_to_headers(self, headers: dict) -> str:
         assert isinstance(headers, dict)
@@ -95,9 +124,15 @@ class AuthController:
         headers.update({
             "Accept": "application/json",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://www.dhlottery.co.kr/user.do?method=login"
+            "Referer": "https://www.dhlottery.co.kr/login",
+            "AJAX": "true",
+            "requestMenuUri": "/login",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Dest": "empty",
         })
         headers.pop("Upgrade-Insecure-Requests", None)
+        headers.pop("Sec-Fetch-User", None)
 
         res = self.http_client.get(
             "https://www.dhlottery.co.kr/login/selectRsaModulus.do",
@@ -106,18 +141,57 @@ class AuthController:
         
         try:
             data = res.json()
-        except ValueError:
-             raise ValueError(f"Failed to parse JSON. St: {res.status_code}")
-        
-        if "data" in data and "rsaModulus" in data["data"]:
-            modulus = data["data"]["rsaModulus"]
-            exponent = data["data"]["publicExponent"]
-            return modulus, exponent
-        
-        if "rsaModulus" in data:
-            return data["rsaModulus"], data["publicExponent"]
-            
-        raise KeyError("rsaModulus not found")
+        except ValueError as e:
+            raise RSAKeyResponseError(
+                f"RSA key response is not valid JSON. {self._rsa_response_summary(res)}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise RSAKeyResponseError(
+                f"RSA key response must be a JSON object. {self._rsa_response_summary(res)}"
+            )
+
+        key_data = data.get("data")
+        if not isinstance(key_data, dict) or "rsaModulus" not in key_data:
+            key_data = data
+
+        modulus = key_data.get("rsaModulus")
+        exponent = key_data.get("publicExponent")
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]+", value)
+                   for value in (modulus, exponent)):
+            raise RSAKeyResponseError(
+                f"RSA key response has missing or invalid key fields. {self._rsa_response_summary(res)}"
+            )
+
+        try:
+            public_exponent = int(exponent, 16)
+            if public_exponent < 3 or public_exponent % 2 == 0:
+                raise ValueError("RSA public exponent must be odd and greater than one")
+            RSA.construct((int(modulus, 16), public_exponent))
+        except ValueError as e:
+            raise RSAKeyResponseError(
+                f"RSA key response has invalid public key parameters. {self._rsa_response_summary(res)}"
+            ) from e
+
+        return modulus, exponent
+
+    @staticmethod
+    def _rsa_response_summary(res: requests.Response) -> str:
+        # Never include the response body, key values, cookies, or URL query.
+        final_url = urlsplit(res.url or "")
+        content_type = res.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", content_type):
+            content_type = "unknown"
+        body = res.text.lstrip()
+        body_kind = "empty" if not body else "html" if body.startswith("<") else "other"
+        return json.dumps({
+            "status": res.status_code,
+            "content_type": content_type,
+            "final_host": final_url.hostname,
+            "final_path": final_url.path.split(";", 1)[0],
+            "response_bytes": len(res.content),
+            "body_kind": body_kind,
+        }, ensure_ascii=True)
 
     def _rsa_encrypt(self, text, modulus, exponent):
         key_spec = RSA.construct((int(modulus, 16), int(exponent, 16)))
@@ -128,9 +202,10 @@ class AuthController:
     def _get_j_session_id_from_response(self, res: requests.Response):
         assert isinstance(res, requests.Response)
 
-        for cookie in res.cookies:
-            if cookie.name == "JSESSIONID":
-                return cookie.value
+        for name in ("JSESSIONID", "DHJSESSIONID"):
+            for cookie in res.cookies:
+                if cookie.name == name:
+                    return cookie.value
         
         return self.get_current_session_id()
 
@@ -151,88 +226,103 @@ class AuthController:
         if new_jsessionid:
              self._update_auth_cred(new_jsessionid)
 
-        try:
-             self.http_client.get("https://www.dhlottery.co.kr/main", headers=self._REQ_HEADERS)
-        except Exception as e:
-             print(f"[Warning] Failed to check main page after login: {e}")
-             
+        logged_in = self._logged_in_marker(res)
+        if logged_in is None:
+            main_page = self.http_client.get("https://www.dhlottery.co.kr/main", headers=self._REQ_HEADERS)
+            logged_in = self._logged_in_marker(main_page)
+        if logged_in is False:
+            raise AuthenticationError("not_authenticated")
+        if logged_in is None:
+            # A protected API must confirm the session when the page has no marker.
+            try:
+                self.get_user_balance(strict=True)
+            except AccountQueryError as e:
+                raise AuthenticationError(e.code) from e
+
         return res
+
+    @staticmethod
+    def _logged_in_marker(res):
+        marker = re.search(r"\b(?:const|let|var)\s+isLoggedIn\s*=\s*(true|false)\s*;", res.text)
+        return marker.group(1) == "true" if marker else None
 
     def _update_auth_cred(self, j_session_id: str) -> None:
         assert isinstance(j_session_id, str)
         self._AUTH_CRED = j_session_id
-        
-        self.http_client.session.cookies.set("JSESSIONID", j_session_id, domain=".dhlottery.co.kr")
+        # requests.Session already stores Set-Cookie with the server's domain/path.
+        # Do not create broader cookies that could shadow the authenticated session.
 
-        wmonid = None
-        for cookie in self.http_client.session.cookies:
-             if cookie.name == "WMONID":
-                 wmonid = cookie.value
-                 break
-        
-        if wmonid:
-             self.http_client.session.cookies.set("WMONID", wmonid, domain=".dhlottery.co.kr")
+    def prepare_game_session(self) -> None:
+        """Retain the existing cross-subdomain cookie setup only for purchases."""
+        session_id = self.get_current_session_id()
+        if session_id:
+            self.http_client.session.cookies.set("JSESSIONID", session_id, domain=".dhlottery.co.kr")
+        for cookie in list(self.http_client.session.cookies):
+            if cookie.name == "WMONID":
+                self.http_client.session.cookies.set("WMONID", cookie.value, domain=".dhlottery.co.kr")
+                break
 
     def get_current_session_id(self) -> str:
-        for cookie in self.http_client.session.cookies:
-            if cookie.name in ["JSESSIONID", "DHJSESSIONID", "WMONID"]:
-                return cookie.value
+        cookies = list(self.http_client.session.cookies)
+        for name in ("JSESSIONID", "DHJSESSIONID"):
+            for cookie in cookies:
+                if cookie.name == name and cookie.domain.lstrip(".") in ("www.dhlottery.co.kr", "dhlottery.co.kr"):
+                    return cookie.value
+            for cookie in cookies:
+                if cookie.name == name:
+                    return cookie.value
         
         if self._AUTH_CRED:
             return self._AUTH_CRED
 
         return ""
             
-    def get_user_balance(self) -> str:
-        last_error = None
-        
-        for attempt in range(3):
-            try:
-                 try:
-                     self.http_client.get("https://www.dhlottery.co.kr/mypage/home")
-                 except requests.RequestException:
-                     pass
+    def get_user_balance(self, strict=False) -> str:
+        headers = copy.deepcopy(self._REQ_HEADERS)
+        headers.update({
+            "Referer": "https://www.dhlottery.co.kr/mypage/home",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "requestMenuUri": "/mypage/home",
+            "AJAX": "true",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Dest": "empty",
+        })
+        headers.pop("Upgrade-Insecure-Requests", None)
+        headers.pop("Sec-Fetch-User", None)
+        try:
+            data = common.get_json_response(
+                self.http_client,
+                "https://www.dhlottery.co.kr/mypage/selectUserMndp.do",
+                headers=headers,
+                params={"_": int(datetime.datetime.now().timestamp() * 1000)},
+            )
+            if "data" in data:
+                data = data["data"]
+            if not isinstance(data, dict):
+                raise common.LotteryQueryError("invalid_response")
+            if "userMndp" in data:
+                data = data["userMndp"]
+            if not isinstance(data, dict):
+                raise common.LotteryQueryError("invalid_response")
 
-                 timestamp = int(datetime.datetime.now().timestamp() * 1000)
-                 url = f"https://www.dhlottery.co.kr/mypage/selectUserMndp.do?_={timestamp}"
-                 
-                 headers = copy.deepcopy(self._REQ_HEADERS)
-                 headers.update({
-                    "Referer": "https://www.dhlottery.co.kr/mypage/home",
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Content-Type": "application/json;charset=UTF-8",
-                    "Accept": "application/json, text/javascript, */*; q=0.01",
-                    "requestMenuUri": "/mypage/home",
-                    "AJAX": "true",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "same-origin",
-                    "Sec-Fetch-Dest": "empty"
-                 })
-                 
-                 res = self.http_client.get(url, headers=headers)
-                 
-                 txt = res.text.strip()
-                 if txt.startswith("<"):
-                      return "확인 불가 (로그인/설정)"
-
-                 data = json.loads(txt)
-                 
-                 if 'data' in data and isinstance(data['data'], dict):
-                     data = data['data']
-
-                 if 'userMndp' in data:
-                     data = data['userMndp']
-                     
-                 if 'totalAmt' in data:
-                     val = str(data['totalAmt']).replace(',', '')
-                     return f"{int(val):,}원"
-                 
-                 return "0원"
-
-            except Exception as e:
-                 last_error = e
-                 time.sleep(1)
-        
-        # If all retries failed
-        print(f"[Error] 잔액 조회에 실패했습니다: {last_error}")
-        return f"정보 로드 실패 (로그 확인)"
+            # The official client computes totalAmt from these six amounts.
+            fields = ("pntDpstAmt", "pntTkmnyAmt", "ncsblDpstAmt",
+                      "ncsblTkmnyAmt", "csblDpstAmt", "csblTkmnyAmt")
+            if any(field in data for field in fields):
+                amounts = [common.parse_amount(0 if data.get(field) is None else data[field])
+                           for field in fields]
+                total = sum(amounts[::2]) - sum(amounts[1::2])
+                if total < 0:
+                    raise common.LotteryQueryError("invalid_amount")
+            elif "totalAmt" in data:
+                total = common.parse_amount(data["totalAmt"])
+            else:
+                raise common.LotteryQueryError("invalid_response")
+            return f"{total:,}원"
+        except common.LotteryQueryError as e:
+            print(f"[Error] 잔액 조회 실패 (stage=balance, code={e.code})", flush=True)
+            if strict:
+                raise AccountQueryError(e.code) from e
+            return "정보 로드 실패 (로그 확인)"
