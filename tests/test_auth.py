@@ -95,7 +95,7 @@ class AuthControllerTests(unittest.TestCase):
         self.assertEqual(headers["X-Requested-With"], "XMLHttpRequest")
         self.assertEqual(
             headers["Referer"],
-            "https://www.dhlottery.co.kr/user.do?method=login",
+            "https://www.dhlottery.co.kr/login",
         )
         self.assertNotIn("Upgrade-Insecure-Requests", headers)
         self.assertEqual(self.controller._REQ_HEADERS, original_headers)

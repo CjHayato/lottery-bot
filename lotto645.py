@@ -234,130 +234,109 @@ class Lotto645:
         assert isinstance(auth_ctrl, auth.AuthController)
 
         headers = self._REQ_HEADERS.copy()
-        headers["Referer"] = "https://www.dhlottery.co.kr/mypage/mylotteryledger"
+        headers.update({
+            "Referer": "https://www.dhlottery.co.kr/mypage/mylotteryledger",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "AJAX": "true",
+            "requestMenuUri": "/mypage/mylotteryledger",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        })
         headers.pop("Content-Type", None)
         headers.pop("Origin", None)
+        headers.pop("Upgrade-Insecure-Requests", None)
+        headers.pop("Sec-Fetch-User", None)
 
         parameters = common.get_search_date_range()
-
-        try:
-            self.http_client.get("https://www.dhlottery.co.kr/common.do?method=main", headers=headers)
-        except requests.RequestException as e:
-            print(f"[Warning] Warm-up request failed: {e}")
-
-        result_data = {
-            "data": "no winning data"
+        params = {
+            "srchStrDt": parameters["searchStartDate"],
+            "srchEndDt": parameters["searchEndDate"],
+            "ltGdsCd": "LO40",
+            "pageNum": 1,
+            "recordCountPerPage": 10,
         }
 
         try:
-            api_url = "https://www.dhlottery.co.kr/mypage/selectMyLotteryledger.do"
-            params = {
-                "srchStrDt": parameters["searchStartDate"],
-                "srchEndDt": parameters["searchEndDate"],
-                "ltGdsCd": "LO40",
-                "pageNum": 1,
-                "recordCountPerPage": 10
+            payload = common.get_json_response(
+                self.http_client,
+                "https://www.dhlottery.co.kr/mypage/selectMyLotteryledger.do",
+                params=params, headers=headers,
+            )
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+                raise common.LotteryQueryError("invalid_response")
+            if not data["list"]:
+                return {"status": "no_data"}
+
+            item = data["list"][0]
+            if not isinstance(item, dict):
+                raise common.LotteryQueryError("invalid_response")
+            round_no = item.get("ltEpsdView")
+            if not isinstance(round_no, (str, int)) or isinstance(round_no, bool):
+                raise common.LotteryQueryError("invalid_response")
+            round_no = str(round_no).replace("회", "").strip()
+            if not round_no.isdigit():
+                raise common.LotteryQueryError("invalid_response")
+            amount = common.parse_amount(item.get("ltWnAmt"))
+            result_data = {
+                "status": "success",
+                "round": round_no,
+                "money": f"{amount:,} 원",
+                "purchased_date": item.get("eltOrdrDt", "-"),
+                "winning_date": item.get("epsdRflDt", "-"),
+                "lotto_details": [],
             }
+        except common.LotteryQueryError as error:
+            logger.error("[Error] Lotto check failed (code=%s)", error.code)
+            return {"status": "error", "error_code": error.code}
 
-            res = self.http_client.get(api_url, params=params, headers=headers)
-            
-            if res.status_code != 200:
-                print(f"DEBUG: API Status {res.status_code}")
-                pass
-            
-            try:
-                data = res.json()
-                data = data.get("data", {})
-                if "list" not in data:
-                    print("DEBUG_DATA_LIST_MISSING_IN_DATA")
-            except (json.JSONDecodeError, AttributeError, KeyError) as e:
-                logger.error(f"[Error] API JSON Parse Failed: {e}")
-                data = {}
+        detail_params = {
+            "ltGdsCd": item.get("ltGdsCd"),
+            "ltEpsd": item.get("ltEpsd"),
+            "barcd": item.get("gmInfo"),
+            "ntslOrdrNo": item.get("ntslOrdrNo"),
+            "srchStrDt": params["srchStrDt"],
+            "srchEndDt": params["srchEndDt"],
+        }
+        try:
+            detail_data = common.get_json_response(
+                self.http_client,
+                "https://www.dhlottery.co.kr/mypage/lotto645TicketDetail.do",
+                params=detail_params, headers=headers,
+            )
+            detail_data = detail_data.get("data", detail_data)
+            if not isinstance(detail_data, dict):
+                raise common.LotteryQueryError("detail_error")
+            ticket = detail_data.get("ticket")
+            if ticket is None and isinstance(detail_data.get("data"), dict):
+                ticket = detail_data["data"].get("ticket")
+            if not isinstance(ticket, dict):
+                raise common.LotteryQueryError("detail_error")
+            game_dtl = ticket.get("game_dtl")
+            win_num = ticket.get("win_num")
+            if not isinstance(game_dtl, list) or not game_dtl or not isinstance(win_num, list):
+                raise common.LotteryQueryError("detail_error")
 
-            if not data.get("list"):
-                 return {"data": "no winning data (empty list or API fail)"}
-
-            for item in data["list"]:
-                purchased_date = item.get("eltOrdrDt", "-")
-                round_no = item.get("ltEpsdView", "")
-                if "회" in round_no:
-                    round_no = round_no.replace("회", "")
-
-                money_raw = item.get("ltWnAmt", "0")
-                if money_raw is None:
-                    money_raw = "0"
-
-                try:
-                    val = int(money_raw)
-                    money = f"{val:,} 원"
-                except (ValueError, TypeError):
-                    money = "0 원"
-
-                result_data = {
-                    "round": round_no,
-                    "money": money,
-                    "purchased_date": purchased_date,
-                    "winning_date": item.get("epsdRflDt", "-"),
-                    "lotto_details": [] 
-                }
-                
-                detail_url = "https://www.dhlottery.co.kr/mypage/lotto645TicketDetail.do"
-                detail_params = {
-                    "ltGdsCd": item.get("ltGdsCd"),
-                    "ltEpsd": item.get("ltEpsd"),
-                    "barcd": item.get("gmInfo"),
-                    "ntslOrdrNo": item.get("ntslOrdrNo"),
-                    "srchStrDt": params["srchStrDt"],
-                    "srchEndDt": params["srchEndDt"]
-                }
-                
-                try:
-                    res_detail = self.http_client.get(detail_url, params=detail_params, headers=headers)
-                    detail_data = res_detail.json()
-                    detail_data = detail_data.get("data", detail_data)
-                    
-                    ticket = detail_data.get("ticket", {})
-                    if not ticket and "data" in detail_data:
-                         ticket = detail_data["data"].get("ticket", {})
-                         
-                    game_dtl = ticket.get("game_dtl", [])
-                    win_num = ticket.get("win_num", [])
-                    
-                    lotto_details = []
-                    
-                    for i, game in enumerate(game_dtl):
-                        label = common.SLOTS[i] if i < len(common.SLOTS) else "?"
-                        
-                        rank = game.get("rank", "0")
-                        status = "낙첨" if rank == "0" else f"{rank}등"
-                        
-                        nums = game.get("num", [])
-                        formatted_nums = []
-                        for num in nums:
-                            if num in win_num:
-                                formatted_nums.append(f"✨{num}")
-                            else:
-                                formatted_nums.append(str(num))
-                        
-                        lotto_details.append({
-                            "label": label,
-                            "status": status,
-                            "result": formatted_nums
-                        })
-                    
-                    result_data["lotto_details"] = lotto_details
-
-                except (requests.RequestException, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-                    logger.error(f"[Error] Detail parse error (url={detail_url}, params={detail_params}): {e}")
-                
-                break
- 
-                            
-        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
-            logger.error(f"[Error] Lotto check error: {e}")
-        except Exception as e:
-            logger.error(f"[Error] Unexpected Lotto check error: {e}")
-            raise
+            lotto_details = []
+            for i, game in enumerate(game_dtl):
+                if not isinstance(game, dict) or not isinstance(game.get("num"), list):
+                    raise common.LotteryQueryError("detail_error")
+                rank = game.get("rank")
+                if isinstance(rank, bool) or not isinstance(rank, (str, int)) or not str(rank).isdigit():
+                    raise common.LotteryQueryError("detail_error")
+                status = "낙첨" if int(rank) == 0 else f"{int(rank)}등"
+                formatted_nums = [f"✨{num}" if num in win_num else str(num) for num in game["num"]]
+                lotto_details.append({
+                    "label": common.SLOTS[i] if i < len(common.SLOTS) else "?",
+                    "status": status,
+                    "result": formatted_nums,
+                })
+            result_data["lotto_details"] = lotto_details
+        except common.LotteryQueryError:
+            logger.error("[Error] Lotto detail failed (code=detail_error)")
+            result_data.update({"detail_error": True, "error_code": "detail_error"})
 
         return result_data
     

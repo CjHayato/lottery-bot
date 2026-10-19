@@ -255,157 +255,106 @@ class Win720:
         assert isinstance(auth_ctrl, auth.AuthController)
 
         headers = self._generate_req_headers(auth_ctrl)
+        headers.update({
+            "Referer": "https://www.dhlottery.co.kr/mypage/mylotteryledger",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "AJAX": "true",
+            "requestMenuUri": "/mypage/mylotteryledger",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Dest": "empty",
+        })
+        headers.pop("Content-Type", None)
+        headers.pop("Origin", None)
 
         parameters = common.get_search_date_range()
-        data = {
-            "nowPage": 1, 
-            "searchStartDate": parameters["searchStartDate"],
-            "searchEndDate": parameters["searchEndDate"],
-            "winGrade": 1,
-            "lottoId": "LP72", 
-            "sortOrder": "DESC"
+        params = {
+            "srchStrDt": parameters["searchStartDate"],
+            "srchEndDt": parameters["searchEndDate"],
+            "ltGdsCd": "LP72",
+            "pageNum": 1,
+            "recordCountPerPage": 10,
         }
+        try:
+            payload = common.get_json_response(
+                self.http_client,
+                "https://www.dhlottery.co.kr/mypage/selectMyLotteryledger.do",
+                params=params, headers=headers,
+            )
+            data = payload.get("data")
+            if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+                raise common.LotteryQueryError("invalid_response")
+            if not data["list"]:
+                return {"status": "no_data"}
 
-        result_data = {
-            "data": "no winning data"
-        }
+            item = data["list"][0]
+            if not isinstance(item, dict):
+                raise common.LotteryQueryError("invalid_response")
+            round_no = item.get("ltEpsdView")
+            if not isinstance(round_no, (str, int)) or isinstance(round_no, bool):
+                raise common.LotteryQueryError("invalid_response")
+            round_no = str(round_no).replace("회", "").strip()
+            if not round_no.isdigit():
+                raise common.LotteryQueryError("invalid_response")
+            amount = common.parse_amount(item.get("ltWnAmt"))
+            result_data = {
+                "status": "success",
+                "round": round_no,
+                "money": f"{amount:,} 원",
+                "purchased_date": item.get("eltOrdrDt", "-"),
+                "winning_date": item.get("epsdRflDt", "-"),
+                "win720_details": [],
+            }
+        except common.LotteryQueryError as error:
+            logger.error("[Error] Win720 check failed (code=%s)", error.code)
+            return {"status": "error", "error_code": error.code}
 
         try:
-            api_url = "https://www.dhlottery.co.kr/mypage/selectMyLotteryledger.do"
-            params = {
-                "srchStrDt": parameters["searchStartDate"],
-                "srchEndDt": parameters["searchEndDate"],
-                "ltGdsCd": "LP72",
-                "pageNum": 1,
-                "recordCountPerPage": 10
-            }
-            
-            res = self.http_client.get(api_url, params=params, headers=headers)
-            
-            if res.status_code == 200:
-                try:
-                    data = res.json()
-                    data = data.get("data", {})
-                    
-                    if data.get("list"):
-                        item = data["list"][0]
-                        
-                        purchased_date = item.get("eltOrdrDt", "-")
-                        round_no = item.get("ltEpsdView", "")
-                        money_raw = item.get("ltWnAmt", "0")
-                        if money_raw is None:
-                            money_raw = "0"
-                        
-                        if "회" in round_no:
-                            round_no = round_no.replace("회", "")
-                        
-                        try:
-                            val = int(money_raw)
-                            money = f"{val:,} 원"
-                        except (ValueError, TypeError):
-                            money = "0 원"
-                            
-                        result_data = {
-                            "round": round_no,
-                            "money": money,
-                            "purchased_date": purchased_date,
-                            "winning_date": item.get("epsdRflDt", "-"),
-                            "win720_details": []
-                        }
-                        
-                        try:
-                            detail_url = "https://www.dhlottery.co.kr/mypage/lottery720select.do"
-                            detail_params = {
-                                "ntslOrdrNo": item.get("ntslOrdrNo")
-                            }
-                            
-                            res_detail = self.http_client.get(detail_url, params=detail_params, headers=headers)
-                            detail_data = res_detail.json()
-                            
-                            detail_data = detail_data.get("data", detail_data)
-                            
-                            win720_details = []
-                            
-                            if "list" in detail_data:
-                                for i, d_item in enumerate(detail_data["list"]):
-                                    label = common.SLOTS[i] if i < len(common.SLOTS) else "?"
-                                    
-                                    info_cn = d_item.get("ltGmInfoCn", "")
-                                    
-                                    rank = d_item.get("wnRnk")
-                                    if rank is None:
-                                        rank = 0
-                                    else:
-                                        try:
-                                            rank = int(rank)
-                                        except (ValueError, TypeError):
-                                            rank = 0
-                                            
-                                    status = "0등" if rank == 0 else f"{rank}등"
-                                    
-                                    if ":" in info_cn:
-                                        parts = info_cn.split(":")
-                                        group = parts[0]
-                                        number_str = parts[1]
-                                        
-                                        hl_count = 0 
-                                        hl_group = False
-                                        
-                                        if rank == 1:
-                                            hl_count = 6
-                                            hl_group = True
-                                        elif rank == 2:
-                                            hl_count = 6
-                                        elif rank == 3:
-                                            hl_count = 5
-                                        elif rank == 4:
-                                            hl_count = 4
-                                        elif rank == 5:
-                                            hl_count = 3
-                                        elif rank == 6:
-                                            hl_count = 2
-                                        elif rank == 7:
-                                            hl_count = 1
-                                        
-                                        formatted_chars = []
-                                        digits = list(number_str)
-                                        L = len(digits)
-                                        
-                                        for idx, digit in enumerate(digits):
-                                            if idx >= (L - hl_count):
-                                                formatted_chars.append(f"[{digit}]")
-                                            else:
-                                                formatted_chars.append(f" {digit} ")
-                                        
-                                        formatted_num = " ".join(formatted_chars)
-                                        
-                                        label = f"{group}조"
-                                        
-                                        result_str = formatted_num
-                                    else:
-                                        label = "?"
-                                        result_str = info_cn
-                                    
-                                    
-                                    win720_details.append({
-                                        "label": label,
-                                        "result": result_str,
-                                        "status": status
-                                    })
-                                    
-                            result_data["win720_details"] = win720_details
+            detail_data = common.get_json_response(
+                self.http_client,
+                "https://www.dhlottery.co.kr/mypage/lottery720select.do",
+                params={"ntslOrdrNo": item.get("ntslOrdrNo")}, headers=headers,
+            )
+            detail_data = detail_data.get("data", detail_data)
+            if not isinstance(detail_data, dict) or not isinstance(detail_data.get("list"), list):
+                raise common.LotteryQueryError("detail_error")
+            if not detail_data["list"]:
+                raise common.LotteryQueryError("detail_error")
 
-                        except Exception as e:
-                            logger.error(f"[Error] Win720 detail error: {e}")
-                            
-                except Exception as e:
-                     logger.error(f"[Error] Win720 list process error: {e}")
-            
-        except Exception as e:
-            logger.error(f"[Error] Win720 check error: {e}")
+            win720_details = []
+            for i, detail in enumerate(detail_data["list"]):
+                if not isinstance(detail, dict):
+                    raise common.LotteryQueryError("detail_error")
+                info_cn = detail.get("ltGmInfoCn")
+                rank_raw = detail.get("wnRnk")
+                if (not isinstance(info_cn, str) or not info_cn
+                        or isinstance(rank_raw, bool)
+                        or not isinstance(rank_raw, (str, int))
+                        or not str(rank_raw).isdigit()):
+                    raise common.LotteryQueryError("detail_error")
+                rank = int(rank_raw)
+                status = "0등" if rank == 0 else f"{rank}등"
+                if ":" in info_cn:
+                    group, number_str = info_cn.split(":", 1)
+                    if not group.isdigit() or not number_str.isdigit():
+                        raise common.LotteryQueryError("detail_error")
+                    hl_count = {1: 6, 2: 6, 3: 5, 4: 4, 5: 3, 6: 2, 7: 1}.get(rank, 0)
+                    result = " ".join(
+                        f"[{digit}]" if idx >= len(number_str) - hl_count else f" {digit} "
+                        for idx, digit in enumerate(number_str)
+                    )
+                    label = f"{group}조"
+                else:
+                    label = "?"
+                    result = info_cn
+                win720_details.append({"label": label, "result": result, "status": status})
+            result_data["win720_details"] = win720_details
+        except common.LotteryQueryError:
+            logger.error("[Error] Win720 detail failed (code=detail_error)")
+            result_data.update({"detail_error": True, "error_code": "detail_error"})
 
         return result_data
-    
 
     def _show_result(self, body: dict) -> None:
         assert isinstance(body, dict)
